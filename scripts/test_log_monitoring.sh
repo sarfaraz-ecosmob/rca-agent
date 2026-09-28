@@ -58,9 +58,13 @@ else
     exit 1
 fi
 
-# --- Helper: count alerts via API ---------------------------------------
+# --- Helper: count alerts created in THIS test window --------------------
+# NOTE: the alerts API caps limit at 200 (limit: le=200); requesting more
+# returns a 422 and a silent zero count. Filter on the test start time instead.
+TEST_START="$(date -u '+%Y-%m-%dT%H:%M:%S')"
+
 count_alerts() {
-    curl -sf "${API}/api/v1/alerts?limit=500" 2>/dev/null \
+    curl -sf "${API}/api/v1/alerts?from_timestamp=${TEST_START}&limit=200" 2>/dev/null \
         | python3 -c 'import sys, json; print(len(json.load(sys.stdin)))' 2>/dev/null \
         || echo "0"
 }
@@ -105,10 +109,10 @@ sleep "${WAIT}"
 
 # --- 4. Verify via API ----------------------------------------------------
 ALERTS_AFTER="$(count_alerts)"
-NEW_ALERTS=$(( ALERTS_AFTER - ALERTS_BEFORE ))
+NEW_ALERTS="${ALERTS_AFTER}"
 
 echo
-echo "Alerts after test:  ${ALERTS_AFTER}  (new: ${NEW_ALERTS})"
+echo "New alerts since ${TEST_START}: ${ALERTS_AFTER}"
 
 if [ "${NEW_ALERTS}" -ge 1 ]; then
     pass "Detected ${NEW_ALERTS} new alert(s)"

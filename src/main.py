@@ -58,6 +58,7 @@ google_chat_notifier = None
 email_notifier = None
 analysis_queue = None
 file_monitor = None
+analysis_job_queue = None
 
 
 @asynccontextmanager
@@ -65,7 +66,7 @@ async def lifespan(app: FastAPI):
     """Application lifespan: startup and shutdown events."""
     global docker_monitor, log_stream_manager, error_detector
     global rca_analyzer, google_chat_notifier, email_notifier, analysis_queue
-    global file_monitor
+    global file_monitor, analysis_job_queue
 
     logger.info("Starting AI RCA Agent...", provider=settings.AI_PROVIDER.value)
 
@@ -85,6 +86,17 @@ async def lifespan(app: FastAPI):
     email_notifier = EmailNotifier()
     docker_monitor = DockerMonitor()
     file_monitor = FileLogMonitor()
+
+    # Serial AI analysis queue: all AI RCA requests (automated alerts AND
+    # manual /analyse calls) are processed one by one with a gap between
+    # calls, so bursts never hit the AI provider in parallel (rate limits).
+    from src.analyzer.analysis_queue import AnalysisQueue
+
+    analysis_job_queue = AnalysisQueue(
+        interval_seconds=settings.AI_ANALYSIS_INTERVAL,
+        job_timeout_seconds=settings.AI_ANALYSIS_TIMEOUT,
+    )
+    await analysis_job_queue.start()
 
     # Wire up callbacks
     log_stream_manager.set_error_detector(error_detector.detect)
@@ -107,6 +119,7 @@ async def lifespan(app: FastAPI):
         runtime.components["google_chat_notifier"] = google_chat_notifier
         runtime.components["rca_analyzer"] = rca_analyzer
         runtime.components["file_monitor"] = file_monitor
+        runtime.components["analysis_job_queue"] = analysis_job_queue
     except Exception as e:
         logger.warning("Failed to register runtime components", error=str(e))
 
@@ -150,6 +163,10 @@ async def lifespan(app: FastAPI):
 
     # Shutdown
     logger.info("Shutting down AI RCA Agent...")
+
+    if analysis_job_queue:
+        await analysis_job_queue.stop()
+
     analysis_worker_task.cancel()
     try:
         await analysis_worker_task
@@ -416,14 +433,33 @@ async def process_analysis_queue() -> None:
                     "ai_provider": "skipped",
                 }
             else:
-                # Perform AI analysis
-                analysis_result = await rca_analyzer.analyze(
-                    container_name=container_name,
-                    container_id=container_id,
-                    log_snippet=log_snippet,
-                    error_type=error_type,
-                    severity=severity,
-                )
+                # Perform AI analysis through the serial queue (one at a time,
+                # spaced out) so concurrent alerts never hit the provider in
+                # parallel and trip rate limits. Falls back to direct analysis
+                # if the queue is at capacity so a report is always produced.
+                analysis_result = None
+                try:
+                    analysis_result = await analysis_job_queue.enqueue(
+                        rca_analyzer.analyze,
+                        container_name=container_name,
+                        container_id=container_id,
+                        log_snippet=log_snippet,
+                        error_type=error_type,
+                        severity=severity,
+                    )
+                except Exception as queue_error:
+                    logger.warning(
+                        "Analysis queue unavailable - analyzing directly",
+                        error=str(queue_error),
+                    )
+                if analysis_result is None:
+                    analysis_result = await rca_analyzer.analyze(
+                        container_name=container_name,
+                        container_id=container_id,
+                        log_snippet=log_snippet,
+                        error_type=error_type,
+                        severity=severity,
+                    )
 
             # Save analysis to database
             try:

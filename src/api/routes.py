@@ -12,6 +12,7 @@ Provides endpoints for:
 
 from __future__ import annotations
 
+import asyncio
 import logging
 from datetime import datetime, timedelta
 from typing import Any, Dict, List, Optional
@@ -536,14 +537,40 @@ async def trigger_analysis(
     if not log_snippet:
         log_snippet = f"No log snippet provided. Using error type: {request.error_type}"
 
-    # Perform AI analysis using the runtime-configured analyzer (falls back to env)
+    # Perform AI analysis using the runtime-configured analyzer (falls back to env).
+    # Goes through the serial analysis queue when available so manual requests
+    # are processed one by one alongside automated alert analyses.
     analyzer = _get_runtime_analyzer()
-    result = await analyzer.analyze(
-        container_name=request.container_id,
-        container_id=request.container_id,
-        log_snippet=log_snippet,
-        error_type=request.error_type,
-    )
+    from src.analyzer.analysis_queue import AnalysisQueue, QueueFullError
+    from src.config import runtime
+
+    job_queue: Optional[AnalysisQueue] = runtime.components.get("analysis_job_queue")
+    try:
+        if job_queue is not None and job_queue.get_stats()["running"]:
+            result = await job_queue.enqueue(
+                analyzer.analyze,
+                container_name=request.container_id,
+                container_id=request.container_id,
+                log_snippet=log_snippet,
+                error_type=request.error_type,
+            )
+        else:
+            result = await analyzer.analyze(
+                container_name=request.container_id,
+                container_id=request.container_id,
+                log_snippet=log_snippet,
+                error_type=request.error_type,
+            )
+    except QueueFullError:
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="Analysis queue is full - try again shortly",
+        )
+    except (TimeoutError, asyncio.TimeoutError):
+        raise HTTPException(
+            status_code=status.HTTP_504_GATEWAY_TIMEOUT,
+            detail="AI analysis timed out - try again shortly",
+        )
 
     # Save to database (may fail if container_id doesn't exist in containers table)
     analysis = None
@@ -967,6 +994,17 @@ async def health_check(
 
     uptime = time.time() - start_time
 
+    # Serial analysis queue stats (None if the queue is not initialized yet)
+    queue_stats = None
+    try:
+        from src.config import runtime as _runtime
+
+        _queue = _runtime.components.get("analysis_job_queue")
+        if _queue is not None:
+            queue_stats = _queue.get_stats()
+    except Exception as e:
+        logger.debug(f"Queue stats unavailable: {e}")
+
     return HealthResponse(
         status="healthy" if db_connected else "degraded",
         uptime_seconds=uptime,
@@ -974,6 +1012,7 @@ async def health_check(
         db_connected=db_connected,
         ai_provider_configured=ai_configured,
         notifications_configured=notifications,
+        analysis_queue=queue_stats,
     )
 
 

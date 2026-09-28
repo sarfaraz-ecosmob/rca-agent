@@ -14,6 +14,7 @@ Analyzes container logs, identifies root cause, and suggests solutions.
 
 from __future__ import annotations
 
+import asyncio
 import json
 import logging
 import os
@@ -432,8 +433,13 @@ Focus on accuracy and actionable insights. Be specific about commands, configura
 class BaseAIClient:
     """Base class for AI provider clients."""
 
+    # HTTP statuses worth retrying: rate limits and transient server errors.
+    RETRYABLE_STATUS = (429, 500, 502, 503, 504)
+
     def __init__(self):
         self.timeout = 60
+        self.max_retries = 3
+        self.retry_base_delay = 5.0  # seconds; doubled on each retry
 
     async def analyze(self, prompt: str) -> str:
         """Send analysis prompt to AI and return response."""
@@ -442,6 +448,40 @@ class BaseAIClient:
     def is_configured(self) -> bool:
         """Check if this client is properly configured."""
         raise NotImplementedError
+
+    async def _post_with_retry(
+        self,
+        client: "httpx.AsyncClient",
+        url: str,
+        headers: Dict[str, str],
+        payload: Dict[str, Any],
+        label: str = "AI",
+    ) -> "httpx.Response":
+        """POST with exponential backoff on 429/5xx (e.g. free-tier rate limits).
+
+        Waits retry_base_delay * 2^attempt between attempts (5s, 10s, 20s by
+        default), then raises the last error if still failing.
+        """
+        last_exc: Optional[httpx.HTTPStatusError] = None
+        for attempt in range(self.max_retries + 1):
+            try:
+                response = await client.post(url, headers=headers, json=payload)
+                response.raise_for_status()
+                return response
+            except httpx.HTTPStatusError as e:
+                status = e.response.status_code
+                if status in self.RETRYABLE_STATUS and attempt < self.max_retries:
+                    delay = self.retry_base_delay * (2**attempt)
+                    logger.warning(
+                        f"{label} request got HTTP {status} "
+                        f"(attempt {attempt + 1}/{self.max_retries + 1}), "
+                        f"retrying in {delay:.0f}s"
+                    )
+                    await asyncio.sleep(delay)
+                    last_exc = e
+                else:
+                    raise
+        raise last_exc  # pragma: no cover - defensive
 
 
 class OllamaClient(BaseAIClient):
@@ -558,29 +598,32 @@ class OpenRouterClient(BaseAIClient):
         self.timeout = 120
 
     async def analyze(self, prompt: str) -> str:
+        headers = {
+            "Authorization": f"Bearer {self.api_key}",
+            "Content-Type": "application/json",
+            "HTTP-Referer": "https://github.com/ai-rca-agent",
+            "X-Title": "AI RCA Agent",
+        }
+        payload = {
+            "model": self.model,
+            "messages": [
+                {
+                    "role": "system",
+                    "content": "You are an expert SRE and DevOps root cause analysis AI. Always respond with valid JSON.",
+                },
+                {"role": "user", "content": prompt},
+            ],
+            "temperature": 0.1,
+            "max_tokens": 2000,
+        }
         async with httpx.AsyncClient(timeout=self.timeout) as client:
-            response = await client.post(
+            response = await self._post_with_retry(
+                client,
                 f"{self.BASE_URL}/chat/completions",
-                headers={
-                    "Authorization": f"Bearer {self.api_key}",
-                    "Content-Type": "application/json",
-                    "HTTP-Referer": "https://github.com/ai-rca-agent",
-                    "X-Title": "AI RCA Agent",
-                },
-                json={
-                    "model": self.model,
-                    "messages": [
-                        {
-                            "role": "system",
-                            "content": "You are an expert SRE and DevOps root cause analysis AI. Always respond with valid JSON.",
-                        },
-                        {"role": "user", "content": prompt},
-                    ],
-                    "temperature": 0.1,
-                    "max_tokens": 2000,
-                },
+                headers=headers,
+                payload=payload,
+                label="OpenRouter",
             )
-            response.raise_for_status()
             data = response.json()
             return data.get("choices", [{}])[0].get("message", {}).get("content", "")
 

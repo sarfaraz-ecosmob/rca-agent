@@ -261,6 +261,7 @@ class HealthResponse(BaseModel):
     db_connected: bool = False
     ai_provider_configured: bool = False
     notifications_configured: Dict[str, bool] = Field(default_factory=dict)
+    analysis_queue: Optional[Dict[str, Any]] = None
 
 
 class FeedbackCreate(BaseModel):

@@ -55,6 +55,8 @@ services:
       - POSTGRES_PASSWORD=${POSTGRES_PASSWORD:-rcagent_secret}
       - POSTGRES_DB=rcagent
       - ENVIRONMENT_TYPE=${ENVIRONMENT_TYPE:-docker-compose}
+      - AI_ANALYSIS_INTERVAL=${AI_ANALYSIS_INTERVAL:-5}
+      - AI_ANALYSIS_TIMEOUT=${AI_ANALYSIS_TIMEOUT:-150}
       - RETENTION_DAYS=${RETENTION_DAYS:-30}
       # Custom log file monitoring (non-Docker applications)
       # Comma-separated paths (inside the container) to log files to tail.

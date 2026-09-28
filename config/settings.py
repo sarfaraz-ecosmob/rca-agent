@@ -107,6 +107,12 @@ class Settings(BaseSettings):
     ENVIRONMENT_TYPE: str = "docker-compose"
 
     # --- Analysis ---
+    # Serial analysis queue: AI RCA requests are processed one at a time with
+    # this gap between calls (protects provider rate limits, e.g. OpenRouter
+    # free tier returns 429 under burst load).
+    AI_ANALYSIS_INTERVAL: float = 5.0
+    # Max seconds for a single AI analysis job before it is abandoned.
+    AI_ANALYSIS_TIMEOUT: float = 150.0
     MAX_LOG_LINES: int = 200
     MAX_LOG_LINES_AFTER: int = 50
     RETENTION_DAYS: int = 30

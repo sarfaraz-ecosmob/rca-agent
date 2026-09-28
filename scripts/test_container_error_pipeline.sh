@@ -196,6 +196,17 @@ print("    Fix       : %s" % str(sol.get("immediate_fix", ""))[:220])
 # --- 5. Check agent logs for pipeline markers -------------------------------
 echo
 echo "Agent container logs (last 5 minutes, pipeline markers):"
+# Notifications are sent right AFTER the "RCA analysis completed" marker, so
+# poll briefly for the Chat marker instead of checking once (race condition).
+CHAT_SENT=0
+for i in 1 2 3 4 5 6; do
+    CHAT_SENT="$(docker compose logs rcagent --since=5m 2>/dev/null \
+        | grep -Ec "Google Chat alert sent" || true)"
+    if [ "${CHAT_SENT}" -ge 1 ]; then
+        break
+    fi
+    sleep 3
+done
 AGENT_MARKERS="$(docker compose logs rcagent --since=5m 2>/dev/null \
     | grep -Ei "Error detected|Alert queued for AI analysis|Starting RCA analysis|RCA analysis completed|RCA completed|Google Chat alert sent" \
     | tail -15 || true)"
@@ -205,8 +216,6 @@ else
     warn "(no pipeline markers found in agent logs)"
 fi
 
-CHAT_SENT="$(docker compose logs rcagent --since=5m 2>/dev/null \
-    | grep -Ec "Google Chat alert sent" || true)"
 if [ "${CHAT_SENT}" -ge 1 ]; then
     pass "Google Chat notification sent (${CHAT_SENT} card(s))"
 else
