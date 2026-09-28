@@ -36,7 +36,7 @@ class EmailNotifier:
         self,
         smtp_server: Optional[str] = None,
         smtp_port: Optional[int] = None,
-        use_tls: bool = True,
+        use_tls: Optional[bool] = None,
         username: Optional[str] = None,
         password: Optional[str] = None,
         from_addr: Optional[str] = None,
@@ -44,7 +44,7 @@ class EmailNotifier:
     ):
         self.smtp_server = smtp_server or settings.SMTP_SERVER
         self.smtp_port = smtp_port or settings.SMTP_PORT
-        self.use_tls = use_tls or settings.SMTP_USE_TLS
+        self.use_tls = use_tls if use_tls is not None else settings.SMTP_USE_TLS
         self.username = username or settings.SMTP_USER
         self.password = password or settings.SMTP_PASSWORD
         self.from_addr = from_addr or settings.EMAIL_FROM
@@ -60,10 +60,18 @@ class EmailNotifier:
         confidence: float,
         log_snippet: str = "",
         hostname: str = "",
+        analysis: Optional[Dict[str, Any]] = None,
     ) -> Dict[str, Any]:
         """
         Send an alert notification via email.
-        
+
+        Args:
+            analysis: Optional full RCA analysis result (as produced by
+                RCAAnalyzer.analyze). When provided, the email is enriched with
+                the detailed RCA sections: explanation, possible impact,
+                permanent fix, preventive actions, best practices, references,
+                and the AI provider used.
+
         Returns:
             Dict with success status and message_id or error.
         """
@@ -85,6 +93,7 @@ class EmailNotifier:
             confidence=confidence,
             log_snippet=log_snippet,
             hostname=hostname,
+            analysis=analysis,
         )
         text_body = self._build_text_body(
             container_name=container_name,
@@ -94,6 +103,7 @@ class EmailNotifier:
             suggested_fix=suggested_fix,
             confidence=confidence,
             hostname=hostname,
+            analysis=analysis,
         )
 
         try:
@@ -161,6 +171,16 @@ class EmailNotifier:
         }.get(severity, "[ALERT]")
         return f"{prefix} RCA Alert - {container_name} - {error_type[:80]}"
 
+    @staticmethod
+    def _esc(text: Any) -> str:
+        """Escape HTML special characters (email bodies are HTML)."""
+        return (
+            str(text)
+            .replace("&", "&amp;")
+            .replace("<", "&lt;")
+            .replace(">", "&gt;")
+        )
+
     def _build_html_body(
         self,
         container_name: str,
@@ -171,6 +191,7 @@ class EmailNotifier:
         confidence: float,
         log_snippet: str,
         hostname: str,
+        analysis: Optional[Dict[str, Any]] = None,
     ) -> str:
         """Build HTML email body with rich formatting."""
         color = {
@@ -180,6 +201,71 @@ class EmailNotifier:
             Severity.LOW: "#28a745",
             Severity.INFO: "#17a2b8",
         }.get(severity, "#6c757d")
+
+        # Enrichment: detailed RCA sections (present only when a full analysis
+        # result is provided by the caller). The immediate fix is already shown
+        # in the "Suggested Fix" field, so the remediation section adds the
+        # long-term/preventive guidance only.
+        extra_sections = ""
+        provider = "unknown"
+        analyzed_at_html = ""
+        if analysis:
+            provider = self._esc(analysis.get("ai_provider", "unknown"))
+            analyzed_at = analysis.get("analyzed_at", "")
+            if analyzed_at:
+                analyzed_at_html = f" | {self._esc(str(analyzed_at)[:19])} UTC"
+
+            def _section(title: str, body: str) -> str:
+                body = str(body or "").strip()
+                if not body:
+                    return ""
+                return (
+                    f'<div class="rca-section">'
+                    f'<p class="rca-title">{title}</p>'
+                    f'<p class="rca-steps">{self._esc(body)}</p></div>'
+                )
+
+            rc = analysis.get("root_cause", {}) or {}
+            detail_lines = []
+            if rc.get("component"):
+                detail_lines.append(f"Component: {rc['component']}")
+            if rc.get("dependency"):
+                detail_lines.append(f"Dependency: {rc['dependency']}")
+            probability = rc.get("probability")
+            if isinstance(probability, (int, float)) and probability > 0:
+                detail_lines.append(f"Root-Cause Probability: {probability * 100:.0f}%")
+
+            sections_html = []
+            if detail_lines:
+                sections_html.append(_section("🔎 Root Cause Details", "\n".join(detail_lines)))
+
+            explanation = analysis.get("explanation", "")
+            if explanation:
+                sections_html.append(_section("📋 Analysis", str(explanation)[:1500]))
+
+            impact = analysis.get("possible_impact", "")
+            if impact:
+                sections_html.append(_section("💥 Possible Impact", str(impact)[:600]))
+
+            solutions = analysis.get("solutions", {}) or {}
+            rem_parts = []
+            for key, label in (
+                ("permanent_fix", "🔒 Permanent fix"),
+                ("preventive_action", "🛡 Prevention"),
+                ("best_practices", "⭐ Best practices"),
+            ):
+                value = str(solutions.get(key, "") or "").strip()
+                if value:
+                    rem_parts.append(f"{label}:\n{str(value)[:600]}")
+            if rem_parts:
+                sections_html.append(_section("🛠 Remediation Plan", "\n\n".join(rem_parts)))
+
+            references = analysis.get("references", []) or []
+            if references:
+                ref_items = "\n".join(f"• {str(r)[:200]}" for r in references[:5])
+                sections_html.append(_section("📚 References", ref_items))
+
+            extra_sections = "\n            ".join(s for s in sections_html if s)
 
         return f"""<!DOCTYPE html>
 <html>
@@ -195,6 +281,9 @@ class EmailNotifier:
         .field-label {{ font-size: 12px; color: #666; text-transform: uppercase; margin-bottom: 3px; }}
         .field-value {{ font-size: 14px; color: #333; }}
         .log-snippet {{ background: #f5f5f5; padding: 10px; border-radius: 4px; font-family: 'Courier New', monospace; font-size: 12px; white-space: pre-wrap; overflow-x: auto; max-height: 200px; }}
+        .rca-section {{ background: #f8f9fa; border-left: 4px solid {color}; border-radius: 4px; padding: 12px 15px; margin-bottom: 12px; }}
+        .rca-title {{ font-size: 13px; font-weight: bold; color: #333; margin: 0 0 6px; }}
+        .rca-steps {{ font-size: 13px; color: #444; line-height: 1.5; margin: 0; white-space: pre-wrap; }}
         .severity-badge {{ display: inline-block; padding: 3px 8px; border-radius: 12px; color: white; font-size: 12px; font-weight: bold; background-color: {color}; }}
         .footer {{ background: #f8f9fa; padding: 15px; text-align: center; font-size: 12px; color: #666; }}
         .button {{ display: inline-block; padding: 10px 20px; background-color: #007bff; color: white; text-decoration: none; border-radius: 5px; margin-top: 10px; }}
@@ -239,10 +328,10 @@ class EmailNotifier:
                 <div class="field-label">Log Snippet</div>
                 <div class="log-snippet">{log_snippet[:1000]}</div>
             </div>
-
+            {extra_sections}
         </div>
         <div class="footer">
-            Generated by <strong>AI RCA Agent</strong> | Confidence: {confidence * 100:.0f}%
+            Generated by <strong>AI RCA Agent</strong> | Provider: {provider} | Confidence: {confidence * 100:.0f}%{analyzed_at_html}
         </div>
     </div>
 </body>
@@ -257,8 +346,56 @@ class EmailNotifier:
         suggested_fix: str,
         confidence: float,
         hostname: str,
+        analysis: Optional[Dict[str, Any]] = None,
     ) -> str:
         """Build plain text email body."""
+        extra = ""
+        provider = "unknown"
+        if analysis:
+            provider = str(analysis.get("ai_provider", "unknown"))
+            parts = []
+
+            rc = analysis.get("root_cause", {}) or {}
+            detail_lines = []
+            if rc.get("component"):
+                detail_lines.append(f"Component: {rc['component']}")
+            if rc.get("dependency"):
+                detail_lines.append(f"Dependency: {rc['dependency']}")
+            probability = rc.get("probability")
+            if isinstance(probability, (int, float)) and probability > 0:
+                detail_lines.append(f"Root-Cause Probability: {probability * 100:.0f}%")
+            if detail_lines:
+                parts.append("--- Root Cause Details ---\n" + "\n".join(detail_lines))
+
+            if analysis.get("explanation"):
+                parts.append("--- Analysis ---\n" + str(analysis["explanation"])[:1500])
+
+            if analysis.get("possible_impact"):
+                parts.append("--- Possible Impact ---\n" + str(analysis["possible_impact"])[:600])
+
+            solutions = analysis.get("solutions", {}) or {}
+            rem_parts = []
+            for key, label in (
+                ("permanent_fix", "Permanent fix"),
+                ("preventive_action", "Prevention"),
+                ("best_practices", "Best practices"),
+            ):
+                value = str(solutions.get(key, "") or "").strip()
+                if value:
+                    rem_parts.append(f"{label}:\n{str(value)[:600]}")
+            if rem_parts:
+                parts.append("--- Remediation Plan ---\n" + "\n\n".join(rem_parts))
+
+            references = analysis.get("references", []) or []
+            if references:
+                parts.append(
+                    "--- References ---\n"
+                    + "\n".join(f"• {str(r)[:200]}" for r in references[:5])
+                )
+
+            if parts:
+                extra = "\n\n" + "\n\n".join(parts)
+
         return f"""
 === {severity.value.upper()} ERROR DETECTED ===
 
@@ -271,13 +408,13 @@ Severity: {severity.value.upper()}
 {root_cause}
 
 --- Suggested Fix ---
-{suggested_fix}
+{suggested_fix}{extra}
 
 --- AI Confidence ---
 {confidence * 100:.0f}%
 
 ---
-Generated by AI RCA Agent
+Generated by AI RCA Agent | Provider: {provider}
 """
 
     def is_configured(self) -> bool:

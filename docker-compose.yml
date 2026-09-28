@@ -44,6 +44,7 @@ services:
       - GOOGLE_CHAT_WEBHOOK_URL=${GOOGLE_CHAT_WEBHOOK_URL:-}
       - SMTP_SERVER=${SMTP_SERVER:-}
       - SMTP_PORT=${SMTP_PORT:-587}
+      - SMTP_USE_TLS=${SMTP_USE_TLS:-true}
       - SMTP_USER=${SMTP_USER:-}
       - SMTP_PASSWORD=${SMTP_PASSWORD:-}
       - EMAIL_FROM=${EMAIL_FROM:-rcagent@example.com}
@@ -53,6 +54,7 @@ services:
       - POSTGRES_USER=rcagent
       - POSTGRES_PASSWORD=${POSTGRES_PASSWORD:-rcagent_secret}
       - POSTGRES_DB=rcagent
+      - ENVIRONMENT_TYPE=${ENVIRONMENT_TYPE:-docker-compose}
       - RETENTION_DAYS=${RETENTION_DAYS:-30}
       # Custom log file monitoring (non-Docker applications)
       # Comma-separated paths (inside the container) to log files to tail.
@@ -88,6 +90,38 @@ services:
       options:
         max-size: "10m"
         max-file: "3"
+
+  # ============================================
+  # Error Generator - Test Container (profile: test)
+  # ============================================
+  # Generates realistic CRITICAL/HIGH error logs so the RCA pipeline
+  # (DockerMonitor -> ErrorDetector -> RCA via OpenRouter -> Google Chat)
+  # can be exercised end-to-end. Not started by default; run with:
+  #   docker compose --profile test run --rm error-generator
+  # or use scripts/test_container_error_pipeline.sh
+  error-generator:
+    build:
+      context: ./tests/error_generator
+      dockerfile: Dockerfile
+    image: rca-error-generator:latest
+    container_name: rca-error-generator
+    profiles:
+      - test
+    # Unique name per run so the agent treats each run as a new container
+    # and dedup windows never suppress a fresh test.
+    environment:
+      - ERROR_MODE=${ERROR_MODE:-burst}
+      - ERROR_INTERVAL_SECONDS=${ERROR_INTERVAL_SECONDS:-1.5}
+      - ERROR_BURSTS=${ERROR_BURSTS:-1}
+    depends_on:
+      - rcagent
+    networks:
+      - rcagent_network
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "1m"
+        max-file: "1"
 
   # ============================================
   # PostgreSQL - Database (internal only)

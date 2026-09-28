@@ -223,6 +223,7 @@ All configuration is done through **environment variables**. Set them:
 | Variable | Default | Description |
 |----------|---------|-------------|
 | `AI_PROVIDER` | `ollama` | AI provider to use |
+| `ENVIRONMENT_TYPE` | `docker-compose` | Deployment environment for the monitored workloads. Controls which remediation commands the AI suggests — e.g. with `docker-compose` it will never suggest `kubectl`/`helm`. Supported: `docker-compose`, `docker`, `kubernetes`, `vm`, `bare-metal`, `other` |
 
 **Ollama (local, free):**
 ```bash

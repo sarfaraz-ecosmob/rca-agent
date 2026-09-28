@@ -156,6 +156,53 @@ class RCAAnalyzer:
                 log_snippet=log_snippet,
             )
 
+    # Orchestration-tool guidance per deployment environment.
+    # "forbidden" tooling must NEVER appear in suggested fixes; "preferred"
+    # tooling is what the AI should reference in remediation steps.
+    _ENVIRONMENT_GUIDANCE = {
+        "docker-compose": {
+            "preferred": "Docker Compose (docker compose ...), plain docker CLI (docker ps/logs/restart/exec), and the application's own config",
+            "forbidden": "kubectl, helm, k9s, istioctl, or any other Kubernetes/Service-Mesh command",
+        },
+        "docker": {
+            "preferred": "plain docker CLI (docker ps/logs/restart/exec/inspect) and the application's own config",
+            "forbidden": "kubectl, helm, or any other Kubernetes/Service-Mesh command",
+        },
+        "kubernetes": {
+            "preferred": "kubectl and helm as appropriate",
+            "forbidden": "docker compose or docker-swarm specific commands",
+        },
+        "vm": {
+            "preferred": "systemd (systemctl/journalctl), process supervision, and the application's own config",
+            "forbidden": "kubectl, helm, docker compose, or any container-orchestration command",
+        },
+        "bare-metal": {
+            "preferred": "systemd (systemctl/journalctl), init scripts, and the application's own config",
+            "forbidden": "kubectl, helm, docker compose, or any container-orchestration command",
+        },
+        "other": {
+            "preferred": "tooling that actually exists in this deployment",
+            "forbidden": "orchestration commands that do not apply to this deployment",
+        },
+    }
+
+    def _deployment_context(self) -> str:
+        """Build the deployment-environment section of the analysis prompt.
+
+        Keeps AI-suggested remediation realistic: only tools that actually
+        exist in the configured environment may be suggested.
+        """
+        env_type = (settings.ENVIRONMENT_TYPE or "docker-compose").strip().lower()
+        guidance = self._ENVIRONMENT_GUIDANCE.get(env_type, self._ENVIRONMENT_GUIDANCE["other"])
+        return (
+            "## Deployment Environment\n"
+            f"- Environment type: {env_type}\n"
+            f"- Available tooling for remediation: {guidance['preferred']}\n"
+            f"- STRICTLY FORBIDDEN in every fix: {guidance['forbidden']}. "
+            "Do not mention these commands even as alternatives. "
+            "Only suggest commands that can actually be run in this environment.\n"
+        )
+
     def _build_analysis_prompt(
         self,
         container_name: str,
@@ -174,6 +221,7 @@ Your task is to analyze the following container logs and provide a comprehensive
 - Error Type: {error_type or "Unknown"}
 - Severity: {severity}
 
+{self._deployment_context()}
 ## Log Snippet (last 200 lines before error + 50 lines after)
 ```
 {log_snippet[:8000]}

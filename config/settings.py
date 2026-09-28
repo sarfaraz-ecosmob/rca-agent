@@ -100,6 +100,12 @@ class Settings(BaseSettings):
     POSTGRES_PASSWORD: str = "rcagent_secret"
     POSTGRES_DB: str = "rcagent"
 
+    # --- Deployment Environment ---
+    # Where the monitored workloads run. Controls which remediation commands
+    # the AI may suggest (e.g. no kubectl/helm in docker-compose deployments).
+    # Supported: docker-compose, docker, kubernetes, vm, bare-metal, other
+    ENVIRONMENT_TYPE: str = "docker-compose"
+
     # --- Analysis ---
     MAX_LOG_LINES: int = 200
     MAX_LOG_LINES_AFTER: int = 50

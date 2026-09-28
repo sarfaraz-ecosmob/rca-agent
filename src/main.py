@@ -491,6 +491,7 @@ async def process_analysis_queue() -> None:
                                 confidence=analysis_result.get("confidence", 0.0),
                                 log_snippet=log_snippet[:500],
                                 hostname=container_id[:12],
+                                analysis=analysis_result,
                             )
                         )
                         notifier_tasks.append(chat_task)
@@ -511,6 +512,7 @@ async def process_analysis_queue() -> None:
                                 confidence=analysis_result.get("confidence", 0.0),
                                 log_snippet=log_snippet[:500],
                                 hostname=container_id[:12],
+                                analysis=analysis_result,
                             )
                         )
                         notifier_tasks.append(email_task)

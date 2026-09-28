@@ -45,16 +45,18 @@ Container A     Container B      Container C
 - **Web Server Errors:** Nginx, Apache, Node.js, Python, Java, Go, PHP
 
 ### AI-Powered RCA
-- Multiple AI providers: Ollama, LM Studio, OpenAI, Azure OpenAI, Anthropic, Google Gemini
+- Multiple AI providers: Ollama, LM Studio, OpenAI, **OpenRouter** (20+ free models), Azure OpenAI, Anthropic, Google Gemini
 - Reads surrounding logs (200 lines before, 50 lines after)
 - Identifies root cause, severity, probability, and impacted components
 - Suggests immediate fix, permanent fix, preventive actions
+- **Environment-aware remediation:** set `ENVIRONMENT_TYPE=docker-compose|docker|kubernetes|vm|bare-metal` and the AI only suggests commands that exist in your deployment (no `kubectl` in Docker environments, etc.)
 - Generates structured RCA reports (JSON, Markdown)
 - Confidence scoring
 
 ### Notifications
-- **Google Chat:** Rich card messages with severity colors
-- **Email:** HTML-formatted alerts with complete RCA details
+- **Google Chat:** rich card with key facts, log snippet, and the full RCA — analysis, possible impact, remediation plan (immediate/permanent/prevention/best practices), references, and the AI provider + confidence
+- **Email:** the same complete RCA as styled HTML (plus a plain-text fallback) via SMTP
+- Both channels fire for critical/high severity alerts, in parallel
 - Deduplication and rate limiting to prevent alert storms
 
 ### Dashboard
@@ -73,7 +75,7 @@ Container A     Container B      Container C
 | Monitoring | Docker SDK, aiodocker |
 | Database | PostgreSQL (SQLAlchemy async) |
 | Cache/Queue | Redis |
-| AI | Ollama / OpenAI / Anthropic / Gemini |
+| AI | Ollama / OpenRouter / OpenAI / Anthropic / Gemini |
 | Frontend | React + TypeScript + MUI |
 | WebSocket | FastAPI WebSocket |
 | Dashboard | Real-time monitoring UI (built-in) |
@@ -123,28 +125,83 @@ curl http://localhost:8000/api/v1/containers
 open http://localhost:3000
 ```
 
+## Testing the Pipeline (Error Generator Container)
+
+The stack ships with a test error-generator container (compose profile `test`)
+that produces realistic CRITICAL/HIGH errors so the full pipeline can be
+exercised end-to-end:
+
+```
+error-generator -> DockerMonitor -> ErrorDetector -> RCA (OpenRouter)
+                -> Google Chat card
+```
+
+One-command E2E test (builds the stack if needed, generates errors, waits for
+the OpenRouter RCA and verifies alerts + incident + Google Chat send):
+
+```bash
+./scripts/test_container_error_pipeline.sh
+```
+
+Or drive the generator manually:
+
+```bash
+# One error burst (12 distinct errors), then the container exits
+docker compose --profile test run --rm error-generator
+
+# Continuous bursts every 5 minutes (stress/demo mode)
+ERROR_MODE=loop BURST_INTERVAL_SECONDS=300 docker compose --profile test up error-generator
+```
+
+Tunables (env): `ERROR_INTERVAL_SECONDS` (gap between lines, default 1.5),
+`ERROR_BURSTS` (bursts per run, default 1), `BURST_INTERVAL_SECONDS` (loop mode).
+
+Notes:
+- Each run creates a uniquely-named container so alert deduplication (300s per
+  pattern) never suppresses a fresh test.
+- OpenRouter free models can be slow/rate-limited; the script waits up to 120s
+  by default (`WAIT=180 ./scripts/test_container_error_pipeline.sh` to extend).
+- Verify results: `curl http://localhost:8000/api/v1/incidents?limit=1` (check
+  `ai_provider: openrouter`) and your Google Chat space for the RCA card.
+
 ## Configuration
 
 Key environment variables (see `.env.example` for full list):
 
 ```bash
-# AI Provider (ollama, openai, anthropic, google_gemini)
-AI_PROVIDER=ollama
-OLLAMA_URL=http://host.docker.internal:11434
-OLLAMA_MODEL=llama3
+# AI Provider (ollama, lm_studio, openai, openrouter, anthropic, google_gemini)
+AI_PROVIDER=openrouter
+OPENROUTER_API_KEY=sk-or-v1-...
+OPENROUTER_MODEL=nvidia/nemotron-3-ultra-550b-a55b:free
+# Ollama (local alternative)
+# OLLAMA_URL=http://host.docker.internal:11434
+# OLLAMA_MODEL=llama3
+
+# Deployment environment — controls which remediation commands the AI suggests
+# (docker-compose | docker | kubernetes | vm | bare-metal | other)
+ENVIRONMENT_TYPE=docker-compose
 
 # Notifications
 GOOGLE_CHAT_WEBHOOK_URL=https://chat.googleapis.com/v1/spaces/...
+
+# Email (SMTP) — enabled when SMTP_SERVER + SMTP_USER are set
 SMTP_SERVER=smtp.gmail.com
+SMTP_PORT=587
+SMTP_USE_TLS=true              # false for SSL-on-connect (port 465)
 SMTP_USER=your-email@gmail.com
-SMTP_PASSWORD=your-app-password
-EMAIL_TO=devops@company.com
+SMTP_PASSWORD=your-16-char-app-password   # Gmail: Account > Security > App passwords
+EMAIL_FROM=your-email@gmail.com
+EMAIL_TO=devops@company.com    # comma-separated for multiple recipients
 
 # Monitoring
 SCAN_INTERVAL=5
 MAX_LOG_LINES=200
 RETENTION_DAYS=30
 ```
+
+> **Gmail users:** use an App Password (Google Account → Security → 2-Step
+> Verification → App passwords), not your login password. Any provider with an
+> SMTP interface (Brevo, SendGrid, Mailgun, ...) works the same way.
 
 ## API Endpoints
 
