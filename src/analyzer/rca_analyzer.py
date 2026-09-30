@@ -625,7 +625,19 @@ class OpenRouterClient(BaseAIClient):
                 label="OpenRouter",
             )
             data = response.json()
-            return data.get("choices", [{}])[0].get("message", {}).get("content", "")
+            message = data.get("choices", [{}])[0].get("message", {}) or {}
+            content = message.get("content") or ""
+            if not content.strip():
+                # Reasoning models (e.g. nemotron via OpenRouter) may spend
+                # their completion budget thinking and return empty `content`
+                # while the actual text lands in `reasoning`/
+                # `reasoning_content`. Fall back so the RCA is not lost.
+                content = (
+                    message.get("reasoning")
+                    or message.get("reasoning_content")
+                    or ""
+                )
+            return content
 
     def is_configured(self) -> bool:
         return bool(self.api_key)

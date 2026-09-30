@@ -13,8 +13,10 @@ import os
 from datetime import datetime
 from typing import Dict, Optional, Set
 
+import aiohttp
 import aiodocker
 from aiodocker.containers import DockerContainer
+from aiodocker.exceptions import DockerError
 from aiodocker.utils import clean_filters
 
 from config.settings import get_settings
@@ -51,15 +53,54 @@ class DockerMonitor:
     async def connect(self) -> None:
         """Connect to Docker daemon."""
         try:
-            # Try connecting via Docker socket
-            docker_host = os.environ.get("DOCKER_HOST")
-            if docker_host:
-                logger.info(f"Connecting to Docker at {docker_host}")
+            docker_host = os.environ.get("DOCKER_HOST") or "unix:///var/run/docker.sock"
+            logger.info(f"Connecting to Docker at {docker_host}")
+            try:
+                # Build the aiohttp session explicitly so we can control two
+                # things aiodocker's default session gets wrong for our use:
+                #
+                # 1. No overall request timeout. aiohttp's default session
+                #    timeout is total=300s, and aiodocker applies it to EVERY
+                #    request on the shared session — including follow=True
+                #    log streams, which are idle by design (no log output =
+                #    no bytes on the wire). After exactly 5 minutes each
+                #    stream dies with a bare TimeoutError and must reconnect.
+                #    The aiodocker authors note this themselves in
+                #    events.py: "timeout has to be set to 0 ... Otherwise
+                #    after 5 minutes the client will close the connection".
+                # 2. Unlimited connection pool (limit=0). With the default
+                #    limit=100, leaked/dying streams eventually exhaust the
+                #    pool and every Docker API call in the process hangs.
+                #
+                # NOTE: when a connector is supplied, aiodocker skips its own
+                # URL normalization, so we must pass the dummy host URL its
+                # constructor would otherwise build for unix sockets
+                # ("unix://localhost") — the real socket path lives in the
+                # connector itself.
+                if docker_host.startswith("unix://"):
+                    connector = aiohttp.UnixConnector(
+                        docker_host[len("unix://"):], limit=0
+                    )
+                    client_url = "unix://localhost"
+                else:
+                    connector = aiohttp.TCPConnector(limit=0)
+                    client_url = docker_host
+                session = aiohttp.ClientSession(
+                    connector=connector,
+                    timeout=aiohttp.ClientTimeout(total=None),
+                )
+                self.docker = aiodocker.Docker(
+                    url=client_url, connector=connector, session=session
+                )
+            except Exception:
+                # Fallback to aiodocker's own session setup, but still
+                # disable the 5-minute default timeout on it.
                 self.docker = aiodocker.Docker(url=docker_host)
-            else:
-                logger.info("Connecting to Docker via local socket")
-                self.docker = aiodocker.Docker()
-            
+                try:
+                    self.docker.session._timeout = aiohttp.ClientTimeout(total=None)
+                except Exception:
+                    pass
+
             # Verify connection
             version = await self.docker.version()
             logger.info(
@@ -67,7 +108,7 @@ class DockerMonitor:
                 f"(API {version.get('ApiVersion', 'unknown')})"
             )
         except Exception as e:
-            logger.error(f"Failed to connect to Docker: {e}")
+            logger.error(f"Failed to connect to Docker: {e!r}")
             raise
 
     async def disconnect(self) -> None:
@@ -191,8 +232,8 @@ class DockerMonitor:
                         await self._stop_monitoring_container(container_id)
 
                 except Exception as e:
-                    logger.debug(f"Error processing container in scan: {e}")
-                    continue
+                    logger.debug(f"Error processing container in scan: {e!r}")
+                continue
 
             # Detect removed containers
             for container_id in list(self._monitored_containers.keys()):
@@ -202,7 +243,10 @@ class DockerMonitor:
             self._discovered_ids = current_ids
 
         except Exception as e:
-            logger.error(f"Error scanning containers: {e}")
+            # repr() instead of str(): connection errors like TimeoutError /
+            # ConnectionRefusedError have an empty str() which made these
+            # log lines unreadable ("Error scanning containers: ").
+            logger.error(f"Error scanning containers: {e!r}")
 
     async def _start_monitoring_container(self, container: DockerContainer) -> None:
         """Start monitoring a single container."""
@@ -294,10 +338,49 @@ class DockerMonitor:
             except asyncio.CancelledError:
                 break
             except Exception as e:
+                # repr() so bare TimeoutError / ConnectionRefusedError (whose
+                # str() is empty) still produce a readable log line.
                 logger.warning(
-                    f"Log stream interrupted for {name}: {e}. Reconnecting..."
+                    f"Log stream interrupted for {name}: {e!r}. Reconnecting..."
                 )
                 await asyncio.sleep(2)
+
+            # The stream loop above returned/ended. If the container is no
+            # longer running (exited / crashed / removed), tear down its
+            # monitoring cleanly instead of leaking the task and its Docker
+            # API connection. This is critical: a leaked follow-stream holds
+            # a pooled connection forever, and enough leaks exhaust the
+            # aiodocker connection pool for the WHOLE process (all Docker
+            # API calls then hang), which stops container discovery too.
+            try:
+                info = await container.show()
+                state = info.get("State", {}).get("Status", "")
+                if state not in ("running", "restarting"):
+                    logger.info(
+                        f"Container {name} is no longer running (state: {state}); "
+                        "stopping log stream"
+                    )
+                    # Remove our own bookkeeping first so
+                    # _stop_monitoring_container does not try to cancel this
+                    # very task from within itself.
+                    self._container_tasks.pop(container_id, None)
+                    self._monitored_containers.pop(container_id, None)
+                    if self._on_container_stop_callback:
+                        try:
+                            await self._on_container_stop_callback(container_id, name)
+                        except Exception as cb_err:
+                            logger.warning(
+                                f"Container stop callback failed for {name}: {cb_err!r}"
+                            )
+                    await self._stop_monitoring_container(container_id)
+                    return
+            except asyncio.CancelledError:
+                raise
+            except Exception as e:
+                logger.debug(f"Post-stream state check failed for {name}: {e!r}")
+                # Avoid a hot spin if the container was removed (show() keeps
+                # failing); the scan loop will reap it within one interval.
+                await asyncio.sleep(1)
 
     async def _stream_jsonfile_logs(
         self, container: DockerContainer, container_id: str, name: str
@@ -319,6 +402,13 @@ class DockerMonitor:
                         container_name=name,
                         log_line=log_line,
                     )
+        except DockerError as e:
+            # 404: container gone; 409: container not running (e.g. it exited
+            # while we were attaching) — both are normal lifecycle events.
+            if e.status in (404, 409):
+                logger.debug(f"Container {name} log stream ended (status {e.status})")
+            else:
+                raise
         except Exception as e:
             if "404" in str(e) or "409" in str(e):
                 logger.debug(f"Container {name} log stream ended (container stopped)")
@@ -342,13 +432,15 @@ class DockerMonitor:
                         await self._on_container_stop_callback(container_id, name)
                     break
 
-                # Get logs since last check
+                # Get logs since last check. Docker's `since` filter expects
+                # a Unix timestamp — a naive datetime str() is silently
+                # misinterpreted by the API, so convert explicitly.
                 logs = await container.log(
                     stdout=True,
                     stderr=True,
                     timestamps=True,
                     tail=100,
-                    since=last_timestamp,
+                    since=int(last_timestamp.timestamp()),
                 )
 
                 for log_line in logs:
@@ -369,17 +461,36 @@ class DockerMonitor:
                 await asyncio.sleep(5)
 
     async def _event_listener(self) -> None:
-        """Listen for Docker events to detect new/stopped containers."""
+        """
+        Listen for Docker events to detect new/stopped containers.
+
+        Uses aiodocker's subscribe() channel API (the run()-based generator
+        API is not usable in this library version: run() is a plain
+        coroutine that streams internally, so awaiting it and iterating the
+        result never yields events — new/started containers were only ever
+        picked up by the periodic scan).
+        """
         if not self.docker:
             return
 
         while self._running:
             try:
-                # Use aiodocker's events API
-                # run() is a coroutine that returns an async generator
-                events_generator = await self.docker.events.run()
-                async for event in events_generator:
-                    if not self._running:
+                # subscribe() spawns the background stream task and returns a
+                # ChannelSubscriber queue.
+                subscriber = self.docker.events.subscribe()
+
+                while self._running:
+                    try:
+                        # wait_for keeps the listener responsive to shutdown
+                        # even when no events arrive.
+                        event = await asyncio.wait_for(subscriber.get(), timeout=30)
+                    except asyncio.TimeoutError:
+                        continue
+
+                    # The channel publishes None when the background stream
+                    # task terminates (connection lost) — reconnect.
+                    if event is None:
+                        logger.warning("Docker events channel closed; reconnecting...")
                         break
 
                     event_type = event.get("Type", "")
@@ -403,7 +514,17 @@ class DockerMonitor:
             except asyncio.CancelledError:
                 break
             except Exception as e:
-                logger.error(f"Error in event listener: {e}")
+                logger.error(f"Error in event listener: {e!r}")
+
+            # Make sure the library's background event-stream task is fully
+            # stopped before retrying, otherwise subscribe() will not spawn a
+            # new one (it guards on an existing task).
+            try:
+                await self.docker.events.stop()
+            except Exception:
+                pass
+
+            if self._running:
                 await asyncio.sleep(5)
 
     async def _persist_container(self, info: dict) -> None:
@@ -466,7 +587,7 @@ class DockerMonitor:
                 await session.commit()
 
             except Exception as e:
-                logger.warning(f"Error persisting container: {e}")
+                logger.warning(f"Error persisting container: {e!r}")
                 await session.rollback()
 
     @property

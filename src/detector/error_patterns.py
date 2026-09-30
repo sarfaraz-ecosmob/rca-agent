@@ -200,6 +200,13 @@ INFRASTRUCTURE_ERRORS: List[ErrorPattern] = [
         description="Connection refused by remote host",
     ),
     ErrorPattern(
+        name="host_unreachable",
+        pattern=r"\b(?:EHOSTUNREACH|host\s+(?:is\s+)?unreachable)\b",
+        category=ErrorCategory.INFRASTRUCTURE,
+        severity=Severity.CRITICAL,
+        description="Remote host unreachable (no route to host)",
+    ),
+    ErrorPattern(
         name="connection_reset",
         pattern=r"\b(?:connection\s+reset|ECONNRESET|connection\s+closed\s+by\s+remote)\b",
         category=ErrorCategory.INFRASTRUCTURE,
@@ -305,6 +312,15 @@ INFRASTRUCTURE_ERRORS: List[ErrorPattern] = [
 # --- Database Error Patterns ---
 
 DATABASE_ERRORS: List[ErrorPattern] = [
+    # Generic database connectivity (any engine)
+    ErrorPattern(
+        name="db_connection_failed",
+        pattern=r"\b(?:database|db)\s+connection\s+(?:failed|refused|lost|error)\b",
+        category=ErrorCategory.DATABASE,
+        severity=Severity.CRITICAL,
+        description="Database connection failed (engine-agnostic)",
+    ),
+
     # MySQL / MariaDB
     ErrorPattern(
         name="mysql_connection",
